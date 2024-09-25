@@ -53,6 +53,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         dt_max=0.1,
         dt_init_floor=1e-4,
         dt_limit=(0.0, float("inf")),
+        learnable_init_states=False,
         bias=False,
         conv_bias=True,
         # Fused kernel and sharding options
@@ -87,6 +88,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.rmsnorm = rmsnorm
         self.norm_before_gate = norm_before_gate
         self.dt_limit = dt_limit
+        self.learnable_init_states = learnable_init_states
         self.activation = "silu"
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
@@ -113,6 +115,10 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         )
         if self.conv_init is not None:
             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+
+        if self.learnable_init_states:
+            self.init_states = nn.Parameter(torch.zeros(self.nheads, self.headdim, self.d_state, **factory_kwargs))
+            self.init_states._no_weight_decay = True
 
         self.act = nn.SiLU()
 
@@ -180,6 +186,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
+        initial_states = repeat(self.init_states, "... -> b ...", b=batch) if self.learnable_init_states else None
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
         if self.use_mem_eff_path and inference_params is None:
             out = mamba_split_conv1d_scan_combined(
@@ -199,6 +206,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 headdim=None if self.D_has_hdim else self.headdim,
                 ngroups=self.ngroups,
                 norm_before_gate=self.norm_before_gate,
+                initial_states=initial_states,
                 **dt_limit_kwargs,
             )
             if seqlen_og is not None:
@@ -253,6 +261,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
                 seq_idx=seq_idx,
+                initial_states=initial_states,
                 cu_seqlens=cu_seqlens,
                 **dt_limit_kwargs,
                 return_final_states=ssm_state is not None,
